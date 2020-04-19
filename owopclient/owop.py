@@ -1,8 +1,8 @@
 import asyncio
 import collections
+import logging
 import random
 import struct
-import threading
 import time
 from enum import Enum
 from typing import Tuple, Callable, Optional, Union, Iterable, Any
@@ -11,6 +11,11 @@ import aiohttp
 import aiohttp_socks
 import numpy as np
 from PIL import Image, ImageFont, ImageDraw
+
+logger = logging.getLogger("root")
+logging.basicConfig(format="[%(levelname)s %(asctime)s %(filename)s:%(lineno)s %(funcName)s] - %(message)s")
+logging.captureWarnings(True)
+logger.setLevel(logging.DEBUG)
 
 TILE_SIZE = 16
 
@@ -54,27 +59,32 @@ class API:
 
     @staticmethod
     async def auth_captcha(ws, token: str):
+        logger.debug(f"API auth_captcha: {token}")
         buf = "CaptchA" + token
         await ws.send_str(buf)
 
     @staticmethod
     async def join_world(ws, worldname: str):
-        buf = worldname.encode() + struct.pack("<H", 4321)
+        logger.debug(f"API join_world: {worldname}")
+        buf = worldname.encode() + struct.pack("<H", 25565)
         await ws.send_bytes(buf)
 
     @staticmethod
     async def send_message(ws, message: str):
+        logger.debug(f"API send_message: {message}")
         # if not self.chatBucket.can_spend(1):
         #     self._do_warn("may be rate limited")
         await ws.send_str(message + "\n")
 
     @staticmethod
     async def request_tile(ws, tx: int, ty: int):
+        logger.debug(f"API request_tile: {tx}, {ty}")
         data = struct.pack("<ii", tx, ty)
-        await ws.send_bytes(data)
+        x = await ws.send_bytes(data)
 
     @staticmethod
     async def update_pixel(ws, x: int, y: int, color: Tuple[int, int, int]):
+        logger.debug(f"API update_pixel: {x}, {x}, {color}")
         # distx = int(x / TILE_SIZE) - int(lastSentX / (TILE_SIZE * 16))
         # distx *= distx
         # disty = int(y / TILE_SIZE) - int(lastSentY / (TILE_SIZE * 16))
@@ -92,6 +102,7 @@ class API:
     # Mouse positions are 16x more precise than pixel positions
     @staticmethod
     async def send_updates(ws, x: int, y: int, selected_color: Tuple[int, int, int], selected_tool: Tool):
+        logger.debug(f"API send_updates: {x}, {y}, {selected_color}, {selected_tool}")
         # self.lastSentX, self.lastSentY = x, y
         data = struct.pack(
             "<iiBBBB",
@@ -101,7 +112,8 @@ class API:
 
     # Need admin perms to set tiles, so don't know if this works yet
     @staticmethod
-    async def set_tile(ws, x: int, y: int, arr: bytes):
+    async def set_tile(ws, x: int, y: int, arr: np.ndarray):
+        logger.debug(f"API set_tile: {x}, {y}, {arr}")
         arr = arr.astype(np.uint8).flatten()
         data = struct.pack("<ii", x, y)
         data += arr
@@ -127,7 +139,7 @@ class Edit:
     def __repr__(self):
         return f"Edit<{self.pos}, {self.color}>"
 
-    def _start_retry(self, cb: Callable, period: int = 3):
+    def _start_retry(self, cb: Callable, period: float = 3):
         async def run():
             while True:
                 cb()
@@ -151,7 +163,7 @@ class EditQueue:
     The order is generaly LIFO, except edit retries take precedence and are moved to the front of the queue
     '''
 
-    def __init__(self, retry_period: int = 3):
+    def __init__(self, retry_period: float = 3):
         self.retry_period = retry_period
         self.edits = collections.deque()
         self.event = asyncio.Event()
@@ -172,7 +184,7 @@ class EditQueue:
     def setevent(self):
         self.event.set()
 
-    async def get(self) -> Edit:
+    async def get(self) -> Optional[Edit]:
         '''
         Retrieves the first edit that has not timed out
         :return:
@@ -262,12 +274,15 @@ class Worker:
         This worker continuously receives incoming events from the API and posts them to the event queue if one is defined
         '''
         while self._flag:
+            logger.debug("Worker trying to get message")
             msg = await self.ws.receive()
             data = msg.data
-            if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSING):
+                logger.info(f"Worker closing from receive loop")
                 await self.close()
                 return
-            elif msg.type == aiohttp.WSMsgType.TEXT:
+            logger.debug(f"Worker received: {data}")
+            if msg.type == aiohttp.WSMsgType.TEXT:
                 if data == "You are banned. Appeal on the OWOP discord server, (https://discord.io/owop)":
                     print(f"Worker {self} is banned")
                     await self.close()
@@ -282,7 +297,7 @@ class Worker:
                 self.id = int.from_bytes(data[1:], "little")
 
             elif data[0] == 5:
-                print(f"Worker {self.proxy} captcha state {CaptchaState(data[1])}")
+                logger.debug(f"Worker {self.proxy} captcha state {CaptchaState(data[1])}")
                 # captcha
                 if CaptchaState(data[1]) == CaptchaState.CA_OK:
                     await API.join_world(self.ws, self.world_name)
@@ -296,6 +311,7 @@ class Worker:
                     # API.auth_captcha(self.ws, captcha_token)
 
             elif self.event_queue is not None:
+                logger.debug(f"Worker pushing event to parent: {data}")
                 await self.event_queue.put(data)
 
     async def connect(self, timeout: float):
@@ -312,15 +328,16 @@ class Worker:
             connector = aiohttp_socks.SocksConnector.from_url(self.proxy)
 
         self.session = aiohttp.ClientSession(connector=connector)
-        print(f"Worker connecting from '{self.proxy}'")
+        logger.debug(f"Worker connecting from '{self.proxy}'")
         try:
-            self.ws = await asyncio.wait_for(self.session.ws_connect("wss://ourworldofpixels.com"), timeout=timeout)
+            self.ws = await asyncio.wait_for(self.session.ws_connect("wss://ourworldofpixels.com/" + self.world_name),
+                                             timeout=timeout)
         except (aiohttp_socks.SocksError, aiohttp_socks.SocksConnectionError, aiohttp.ClientError, ConnectionError,
                 asyncio.TimeoutError):
             print(f"Worker could not connect from '{self.proxy}'")
             await self.close()
             return
-        print(f"Worker connected from '{self.proxy}'")
+        logger.debug(f"Worker connected from '{self.proxy}'")
         self._recv_worker_task = asyncio.ensure_future(self._recv_worker())
         self._send_worker_task = asyncio.ensure_future(self._send_worker())
 
@@ -343,7 +360,7 @@ class Worker:
 
 class Client:
     '''
-    A Client manages multiple workers to allow for posting events from multiple streams (the API allows for up to 4 concurrent connections)
+    A Client manages multiple workers to allow for posting events from multiple streams (the API allows for up to 4 concurrent connections per IP)
     Only one of these workers is configured to allow for the receipt of incoming API events, to eliminate incoming message duplication
     '''
 
@@ -368,14 +385,14 @@ class Client:
         self._event_queue = asyncio.Queue()
         self._edit_queue = None
         self._send_workers = []
-        self._recv_worker_thread = None
+        self._recv_worker_task = None
 
     def __setitem__(self, key, value):
-        return self.post(key, value, timeout=0)
+        return await self.post(key, value)
 
     def __getitem__(self, key):
         bounds = parse_bounds(*key)
-        return self.get(bounds)
+        return await self.get(bounds)
 
     @property
     def alive(self) -> bool:
@@ -407,7 +424,7 @@ class Client:
                     a[ay0:ay1, ax0:ax1] = self.tiles[tx0 + atx, ty0 + aty]
         return a
 
-    async def get(self, bounds: Tuple[int, int, int, int], timeout: Optional[float] = None) -> np.ndarray:
+    async def get(self, bounds: Any) -> np.ndarray:
         '''
         Retrieves a section of the map from the API as delimited by 'bounds'
         '''
@@ -420,21 +437,17 @@ class Client:
         required_tiles -= set(self.tiles)
         if required_tiles:
             get_id, self._get_id = self._get_id, self._get_id + 1
-            self._pending_get_events[get_id] = threading.Event()
+            self._pending_get_events[get_id] = asyncio.Event()
             self._pending_gets[get_id] = required_tiles.copy()
 
             for tx, ty in required_tiles:
                 await API.request_tile(self._send_workers[0].ws, tx, ty)
 
-            try:
-                self._pending_get_events[get_id].wait(timeout)  # TODO: wait() -> wait(1) with self._flag check
-            except KeyboardInterrupt:
-                pass
-            finally:
-                remaining = self._pending_gets.pop(get_id)
-                for pos, color in remaining:
-                    self._edit_queue.remove(Edit(pos, color))
-                self._pending_get_events.pop(get_id)
+            await self._pending_get_events[get_id].wait()  # TODO: wait() -> wait(1) with self._flag check
+            remaining = self._pending_gets.pop(get_id)
+            for pos, color in remaining:
+                await self._edit_queue.remove(Edit(pos, color))
+            self._pending_get_events.pop(get_id)
 
         a = self.draw_tiles(tx0, ty0, tx1, ty1)
 
@@ -446,14 +459,12 @@ class Client:
         return a[dy0:-dy1, dx0:-dx1]
 
     # TODO: make smart a class-level thing? bc if i implement per-post tile refreshes, it would have to recompute the smart edits in the post worker
-    async def post(self, coord: Tuple[int, int], obj: Union[Image.Image, Tuple[int, int, int]], fade: bool = True,
-                   timeout: Optional[float] = None):
+    async def post(self, coord: Any, obj: Union[Image.Image, Tuple[int, int, int]], fade: bool = True):
         '''
         Sets a pixel at a certain location, or posts an image
         :param coord: The coordinate at which to post the change
         :param obj: Either a color 3-tuple or a PIL Image object
         :param fade: Whether to fade the changes in - False will proceed left to right, top to bottom
-        :param timeout:
         :return:
         '''
         x0, y0, x1, y1 = parse_bounds(*coord)
@@ -479,7 +490,7 @@ class Client:
             a = obj
 
         required_edits = []
-        bg = self.get((x, y, x + a.shape[1], y + a.shape[0]))
+        bg = await self.get((x, y, x + a.shape[1], y + a.shape[0]))
         for ay, ax in np.argwhere(~np.all(bg == a, axis=-1)):
             pos, color = (ax + x, ay + y), tuple(a[ay, ax])
             required_edits.append(Edit(pos, color))
@@ -493,16 +504,13 @@ class Client:
         for edit in required_edits:
             await self._edit_queue.add(edit)
         self._edit_queue.setevent()
-        self._pending_post_events[post_id] = threading.Event()
+        self._pending_post_events[post_id] = asyncio.Event()
         self._pending_posts[post_id] = required_edits
 
-        try:
-            self._pending_post_events[post_id].wait(timeout)
-        finally:
-            if timeout is None:
-                await self._edit_queue.remove(*self._pending_posts[post_id])
-                self._pending_posts.pop(post_id)
-                self._pending_post_events.pop(post_id)
+        await self._pending_post_events[post_id].wait()
+        await self._edit_queue.remove(*self._pending_posts[post_id])
+        self._pending_posts.pop(post_id)
+        self._pending_post_events.pop(post_id)
 
     def post_text(self,
                   coord: Tuple[int, int],
@@ -536,7 +544,7 @@ class Client:
             drawer = ImageDraw.Draw(bg)
             drawer.fontmode = fontmode
             drawer.text((0, 0), line, font=font, fill=fill)
-            self.post((x, y), bg, fade=False, timeout=timeout)
+            await self.post((x, y), bg, fade=False)
 
             text_h += line_h
             text_w = max(text_w, line_w)
@@ -550,17 +558,13 @@ class Client:
         :return:
         '''
         while self._flag:
-            data = None
-            try:
-                data = await asyncio.wait_for(self._event_queue.get(), timeout=1)
-            except asyncio.TimeoutError:
-                pass
+            data = await self._event_queue.get()
             if not self._flag:
-                return
-            if not data:  # it can be either None or zero-length
-                continue
+                break
 
-            elif data[0] == 1:
+            logger.debug(f"Client received data: {data}")
+
+            if data[0] == 1:
                 # worldUpdate
 
                 # Cursor updates
@@ -647,7 +651,7 @@ class Client:
         '''
         self._edit_queue = EditQueue(self.retry_period)
         self._send_workers.append(Worker(self.worldname, self._edit_queue, self._event_queue))
-        for i in range(2):
+        for i in range(0):
             self._send_workers.append(Worker(self.worldname, self._edit_queue))
         for proxy in proxies:
             for i in range(3):  # Each IP is allowed at most 4 concurrent connections
@@ -660,18 +664,19 @@ class Client:
             return
         self._flag = True
 
-        self._recv_worker_thread = threading.Thread(target=self._recv_worker)
+        self._recv_worker_task = asyncio.ensure_future(self._recv_worker())
 
     async def close(self):
         '''
         Disconnects the client's workers and closes the client
         :return:
         '''
-        await asyncio.gather(*[worker.close() for worker in self._send_workers])
-
         if not self._flag:
             return
         self._flag = False
+        await asyncio.gather(*[worker.close() for worker in self._send_workers])
+        await self._event_queue.put(None)
+        await self._recv_worker_task
 
 
 def decompress(u8arr: bytes) -> bytes:
@@ -737,3 +742,6 @@ def parse_bounds(*args: Any) -> Tuple[int, int, int, int]:
 
     return x0, y0, x1, y1
 
+
+if __name__ != "__main__":
+    logger.disabled = True
